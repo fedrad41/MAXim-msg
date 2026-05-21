@@ -1,0 +1,6 @@
+{
+  "name": "МАХim",
+  "description": "A terminal-themed encrypted chat with Linux engine simulation",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
