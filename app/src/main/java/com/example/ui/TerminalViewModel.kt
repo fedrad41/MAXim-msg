@@ -10,6 +10,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
@@ -20,6 +22,9 @@ class TerminalViewModel(
     application: Application,
     private val repository: TerminalRepository
 ) : AndroidViewModel(application) {
+
+    private val sessionStartTime = System.currentTimeMillis()
+    private val _isSseConnected = MutableStateFlow(true)
 
     // Locked / Unlocked state of console. Messages are masked in HEX dump if locked.
     private val _isUnlocked = MutableStateFlow(false)
@@ -37,13 +42,23 @@ class TerminalViewModel(
     private val _currentUsername = MutableStateFlow("")
     val currentUsername: StateFlow<String> = _currentUsername
 
-    // Visual terminal logs feed
-    val logs: StateFlow<List<TerminalLogEntity>> = repository.allLogs
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = emptyList()
-        )
+    // Visual terminal logs feed with dynamically decoded plaintext payload if unlocked
+    val logs: StateFlow<List<TerminalLogEntity>> = combine(
+        repository.allLogs,
+        _isUnlocked
+    ) { rawLogs, unlocked ->
+        rawLogs.map { log ->
+            if ((log.type == "msg_in" || log.type == "msg_out") && unlocked) {
+                log.copy(content = CryptographyHelper.decrypt(log.content))
+            } else {
+                log
+            }
+        }
+    }.stateIn(
+        scope = viewModelScope,
+        started = SharingStarted.WhileSubscribed(5000),
+        initialValue = emptyList()
+    )
 
     init {
         checkUserRegistrationAndSetup()
@@ -58,6 +73,7 @@ class TerminalViewModel(
                     if (_isRegistered.value && _currentUsername.value.isNotEmpty() && _currentUsername.value != "anonymous") {
                         val myUsername = _currentUsername.value
                         val freshMessages = NetworkManager.fetchMessages()
+                        _isSseConnected.value = true
                         for (msg in freshMessages) {
                             if (msg.recipient == myUsername || msg.sender == myUsername) {
                                 val existing = repository.getLogByOnlineId(msg.id)
@@ -77,7 +93,7 @@ class TerminalViewModel(
                         }
                     }
                 } catch (e: Exception) {
-                    // Fail silently to avoid network disruption logging clutter
+                    _isSseConnected.value = false
                 }
             }
         }
@@ -235,7 +251,7 @@ class TerminalViewModel(
             appendSystemLog("  /unlock <pass>            - De-mask encrypted message stream")
             appendSystemLog("  /lock                     - Instantly cipher screen memory logs")
             appendSystemLog("  /connect <node_id>        - Bind real-time network handshake")
-            appendSystemLog("  /send \"<packet_text>\"     - Encrypt & transmit a packet globally")
+            appendSystemLog("  /send <user> \"<text>\"     - Encrypt & transmit a packet directly")
             appendSystemLog("  /close                    - Break connection and lock screen")
             appendSystemLog("  /syslog                   - Inspect encryption stack & link metrics")
             appendSystemLog("  /clear                    - Clear system visual screen logs")
@@ -293,10 +309,12 @@ class TerminalViewModel(
         repository.insertUser(newUser)
         _isRegistered.value = true
         _currentUsername.value = username
+        CryptographyHelper.deriveKey(password)
+        _isUnlocked.value = true
 
         appendSystemLog("[OK] CREATING LOCAL SECTOR ACCOUNT FOR PROG: $username")
         appendSystemLog("[OK] SECURING CIPHER ROOT KEYS USING PASSWORD SIGN-IN")
-        appendSystemLog("[SYSTEM]: Setup accomplished! Execute '/unlock <password>' to unlock your deck.")
+        appendSystemLog("[SYSTEM]: Setup accomplished! Console unlocked and keys armed.")
     }
 
     private suspend fun handleLogin(parts: List<String>) {
@@ -332,6 +350,7 @@ class TerminalViewModel(
 
         _isRegistered.value = true
         _currentUsername.value = username
+        CryptographyHelper.deriveKey(password)
         _isUnlocked.value = true
 
         appendSystemLog("[OK] SYSTEM ROOT AUTHENTICATED AS operator: $username")
@@ -356,6 +375,7 @@ class TerminalViewModel(
 
         if (passwordInput == primaryUser?.passwordHash || passwordInput == "backup_access_node_71") {
             _isUnlocked.value = true
+            CryptographyHelper.deriveKey(passwordInput)
             appendSystemLog("[OK] SECURE ENCRYPTION PASSWORD VERIFIED.")
             appendSystemLog("[DECRYPTING CONSOLE CHATTER]... PROGRESS: 100%")
             appendSystemLog("ALL ENCRYPTED PACKETS ARE NOW READABLE CONTENT.")
@@ -366,6 +386,7 @@ class TerminalViewModel(
 
     private suspend fun handleLock() {
         _isUnlocked.value = false
+        CryptographyHelper.clearKey()
         appendSystemLog("[MUTING]: Screen memory sealed. Conversation streams scrambled to high-entropy hex dumps.")
     }
 
@@ -410,50 +431,62 @@ class TerminalViewModel(
             return
         }
 
-        val active = _activeSession.value
-        if (active.isEmpty()) {
-            appendSystemLog("[ERROR]: NO PASSIVE CHAT CONNECTION. Build link routing first: /connect <node_id>")
+        if (parts.size < 3) {
+            appendSystemLog("[BAD SYNTAX]: Use format: /send <username> \"message context\"")
             return
         }
 
-        val messageText: String? = when {
-            fullCommand.contains("\"") -> fullCommand.substringAfter("\"").substringBeforeLast("\"")
-            fullCommand.contains("'") -> fullCommand.substringAfter("'").substringBeforeLast("'")
-            parts.size > 1 -> {
-                parts.drop(1).joinToString(" ")
+        val recipient = parts[1].trim().lowercase()
+        val textAfterRecipient = fullCommand.substringAfter(recipient).trim()
+        val messageText: String = when {
+            textAfterRecipient.startsWith("\"") && textAfterRecipient.endsWith("\"") -> {
+                textAfterRecipient.removeSurrounding("\"")
             }
-            else -> null
+            textAfterRecipient.startsWith("'") && textAfterRecipient.endsWith("'") -> {
+                textAfterRecipient.removeSurrounding("'")
+            }
+            else -> {
+                if (parts.size > 2) {
+                    parts.drop(2).joinToString(" ").trim('\"', '\'')
+                } else {
+                    ""
+                }
+            }
         }
 
-        if (messageText == null || messageText.trim().isEmpty()) {
-            appendSystemLog("[BAD SYNTAX]: Try: /send \"text message packet\"")
+        if (messageText.trim().isEmpty()) {
+            appendSystemLog("[BAD_SYNTAX]: Empty packet context cannot be transmitted.")
             return
         }
 
+        _activeSession.value = recipient
         val myUsername = _currentUsername.value
-        val isOfflineBot = active in listOf("agent_x", "nexus", "oracle", "admin")
+        val isOfflineBot = recipient in listOf("agent_x", "nexus", "oracle", "admin")
 
         if (isOfflineBot) {
             repository.insertLog(
                 TerminalLogEntity(
                     type = "msg_out",
                     sender = "me",
-                    recipient = active,
+                    recipient = recipient,
                     content = messageText
                 )
             )
-            triggerBotResponse(active, messageText)
+            triggerBotResponse(recipient, messageText)
         } else {
+            appendSystemLog("[CONN]: Ciphering outbound message payload via AES-256 GCM...")
+            val encryptedText = repository.encryptText(messageText)
+
             appendSystemLog("[CONN]: Dispatching secure packet to gateway node...")
-            val success = NetworkManager.sendMessage(sender = myUsername, recipient = active, content = messageText)
+            val success = NetworkManager.sendMessage(sender = myUsername, recipient = recipient, content = encryptedText)
             if (success) {
-                appendSystemLog("[OK] Packet transmitted successfully (AES-256 CTR cipher verified).")
+                appendSystemLog("[OK] Packet transmitted securely (AES-256 encrypted payload stored in Firebase).")
                 repository.insertLog(
                     TerminalLogEntity(
                         type = "msg_out",
                         sender = "me",
-                        recipient = active,
-                        content = messageText,
+                        recipient = recipient,
+                        content = encryptedText,
                         onlineMessageId = "sending-${System.currentTimeMillis()}"
                     )
                 )
@@ -529,11 +562,13 @@ class TerminalViewModel(
         if (active.isNotEmpty()) {
             _activeSession.value = ""
             _isUnlocked.value = false
+            CryptographyHelper.clearKey()
             repository.clearLogs()
             appendSystemLog("[CONN] Routing to @$active terminated successfully.")
             appendSystemLog("[SYSTEM] SCREEN ERASED FOR VISUAL SAFETY. CONSOLE RE-LOCKED.")
         } else {
             _isUnlocked.value = false
+            CryptographyHelper.clearKey()
             repository.clearLogs()
             appendSystemLog("[SYSTEM] LOCAL SCREEN PURGED. CONSOLE FULLY DE-AUTH RE-LOCKED.")
         }
@@ -544,12 +579,24 @@ class TerminalViewModel(
         val memoryTotal = Runtime.getRuntime().totalMemory() / 1024 / 1024
         val memoryMax = Runtime.getRuntime().maxMemory() / 1024 / 1024
         
+        val uptimeSeconds = (System.currentTimeMillis() - sessionStartTime) / 1000
+        val hours = uptimeSeconds / 3600
+        val minutes = (uptimeSeconds % 3600) / 60
+        val seconds = uptimeSeconds % 60
+        val uptimeStr = String.format(Locale.US, "%02dh %02dm %02ds", hours, minutes, seconds)
+        
+        val sseStatus = if (_isSseConnected.value) "CONNECTED" else "DISCONNECTED"
+        val packetCount = logs.value.count { it.type == "msg_in" || it.type == "msg_out" }
+
         appendSystemLog("==================== CORE META LOGS ====================")
         appendSystemLog("KERNEL ARCH   : Android ARM64-v8a Linux Runtime Node")
         appendSystemLog("HANDSHAKE IP  : 127.0.0.1:41655 (Loopback Link Local)")
         appendSystemLog("PING ROUTING  : 31 ms (Safe latency standard)")
-        appendSystemLog("ENCRYPTION    : Ephemeral CTR AES-256 / SHA-256 HMAC integrity")
+        appendSystemLog("ENCRYPTION    : Ephemeral CBC AES-256 + IV / PBKDF2 stretch")
         appendSystemLog("SEC MASTER KEY: Derived PBKDF2 local identity block")
+        appendSystemLog("SSE LINK FEED : $sseStatus (Background Active Handshake)")
+        appendSystemLog("SESSION UPTIME: $uptimeStr")
+        appendSystemLog("PACKETS METRC : $packetCount logs intercepted/cached")
         appendSystemLog("DB PROFILE    : Room SQLite V1 (/data/system/core.db)")
         appendSystemLog("JVM HEAP UNIT : ${memoryTotal}MB / ${memoryMax}MB allocated")
         appendSystemLog("ACTIVE LINK   : $activeStr")

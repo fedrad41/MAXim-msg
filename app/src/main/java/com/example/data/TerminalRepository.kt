@@ -15,7 +15,22 @@ class TerminalRepository(
     suspend fun getUserCount(): Int = userDao.getUserCount()
     suspend fun insertUser(user: UserEntity) = userDao.insertUser(user)
 
-    suspend fun insertLog(log: TerminalLogEntity) = terminalLogDao.insertLog(log)
+    suspend fun insertLog(log: TerminalLogEntity) {
+        val finalLog = if (log.type == "msg_in" || log.type == "msg_out") {
+            if (!log.content.startsWith("ENC:")) {
+                log.copy(content = CryptographyHelper.encrypt(log.content))
+            } else {
+                log
+            }
+        } else {
+            log
+        }
+        terminalLogDao.insertLog(finalLog)
+    }
+
+    fun encryptText(plainText: String): String {
+        return CryptographyHelper.encrypt(plainText)
+    }
     suspend fun clearLogs() = terminalLogDao.clearLogs()
     suspend fun getAllLogs(): List<TerminalLogEntity> = terminalLogDao.getAllLogs()
     suspend fun getLogByOnlineId(onlineId: String): TerminalLogEntity? = terminalLogDao.getLogByOnlineId(onlineId)
